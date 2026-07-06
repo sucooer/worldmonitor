@@ -42,7 +42,13 @@ const CATALOG = {
   'pdt_0Nbttnqrfh51cRqhMdVLx': { planKey: 'enterprise', tierGroup: 'enterprise', billingPeriod: 'none' },
 };
 
-// Marketing features and display config (doesn't change with Dodo prices)
+// Marketing features and display config (doesn't change with Dodo prices).
+// ⚠ MANUAL MIRROR — three copies of this tier config exist and must move
+// together: convex/config/productCatalog.ts (source of truth,
+// marketingFeatures), this TIER_CONFIG, and DODO_TIER_CONFIG in
+// scripts/ais-relay.cjs (the Railway seeder whose Redis payload WINS over
+// this endpoint's fallback on cache hits). Parity is enforced by
+// tests/product-catalog-freshness.test.mjs — extend it when adding fields.
 const TIER_CONFIG = {
   free: {
     name: 'Free',
@@ -71,7 +77,7 @@ const TIER_CONFIG = {
     name: 'API Business',
     localeKey: 'apiBusiness',
     description: 'High-volume API for teams',
-    features: ['Everything in API Starter', '300 requests/minute', '10,000 requests/day included', 'Priority support', 'XLSX exports'],
+    features: ['Everything in API Starter', '300 requests/minute', '10,000 requests/day included', 'Priority support'],
     highlighted: false,
   },
   enterprise: {
