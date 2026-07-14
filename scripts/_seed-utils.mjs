@@ -667,8 +667,7 @@ export function shouldEnvelopeKey(key) {
 
 export async function writeExtraKey(key, data, ttl, envelopeMeta) {
   const { url, token } = getRedisCredentials();
-  const value = envelopeMeta && shouldEnvelopeKey(key) ? buildEnvelope({ ...envelopeMeta, data }) : data;
-  const payload = JSON.stringify(value);
+  const payload = serializeExtraKeyValue(key, data, envelopeMeta);
   const resp = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
@@ -677,6 +676,17 @@ export async function writeExtraKey(key, data, ttl, envelopeMeta) {
   });
   if (!resp.ok) throw new Error(`Extra key ${key}: write failed (HTTP ${resp.status})`);
   console.log(`  Extra key ${key}: written`);
+}
+
+/** Serialize an extra key exactly as it is persisted to Redis. */
+export function serializeExtraKeyValue(key, data, envelopeMeta) {
+  const value = envelopeMeta && shouldEnvelopeKey(key) ? buildEnvelope({ ...envelopeMeta, data }) : data;
+  return JSON.stringify(value);
+}
+
+/** Return the UTF-8 size of an extra-key value as Redis receives it. */
+export function extraKeyPayloadBytes(key, data, envelopeMeta) {
+  return Buffer.byteLength(serializeExtraKeyValue(key, data, envelopeMeta), 'utf8');
 }
 
 export async function writeSeedMeta(dataKey, recordCount, metaKeyOverride, metaTtlSeconds) {
@@ -1299,6 +1309,60 @@ export function shouldSkipEmptyExtraKey(ek, recordCount) {
   return Boolean(ek && ek.skipWhenEmpty) && recordCount === 0;
 }
 
+/**
+ * Hard ceiling for a single seeded extra-key value — a blunt catastrophe backstop,
+ * not the primary guard (that is findLeakedPrePublishFields below).
+ *
+ * Calibrated against a full scan of production (2026-07-14): the largest seeded value
+ * in Redis is health:vpd-tracker:realtime:v1 at 3.14 MB, and only three exceed 2 MB.
+ * 8 MB therefore leaves ~2.5x headroom over the largest legitimate payload — so ordinary
+ * growth cannot crash a healthy seeder — while still refusing the 11.5 MB
+ * forecast:predictions-bootstrap:v1 that triggered this guard.
+ */
+export const MAX_SEEDED_VALUE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Detect an extra key that is re-exporting the seeder's PRE-PUBLISH internals.
+ *
+ * The trap (production incident, forecast:predictions-bootstrap:v1): runSeed feeds
+ * `publishTransform(data)` to the canonical key but feeds RAW `data` to every extraKey
+ * transform. A transform written as `{ ...data, <tweak> }` therefore ships the entire
+ * internal pipeline state — for seed-forecasts that was fullRunPredictions, inputs,
+ * publishSelectionPool, situationClusters, stateUnits, telemetry: an 11.5 MB key, 66x
+ * larger than the 172 KB canonical key it was meant to compact.
+ *
+ * The invariant: `publishTransform` exists precisely to STRIP pre-publish internals from
+ * the canonical payload. Any field it dropped, resurfacing in an extra key, is that same
+ * internal state escaping through a side door.
+ *
+ * So we flag exactly the intersection:
+ *     present in raw `data`  AND  present in `ekData`  AND  absent from `publishData`
+ *
+ * Fields an extra key legitimately ADDS (markers like `detailStripped`) never appear in
+ * raw `data`, so they are not flagged. Fields the canonical key keeps are not flagged.
+ * A seeder that genuinely must re-export a pre-publish field can opt out per-key with
+ * `allowPrePublishFields: ['inputs']`.
+ *
+ * Pure function — extracted for tests.
+ *
+ * @returns {string[]} leaked top-level field names (empty when clean)
+ */
+export function findLeakedPrePublishFields(rawData, publishData, ekData, ek = {}) {
+  const isPlain = (v) => v && typeof v === 'object' && !Array.isArray(v);
+  // No publishTransform → publishData IS rawData → nothing was stripped → nothing to leak.
+  if (!isPlain(rawData) || !isPlain(publishData) || !isPlain(ekData)) return [];
+  if (rawData === publishData) return [];
+
+  const allowed = new Set(ek.allowPrePublishFields || []);
+  const canonicalFields = new Set(Object.keys(publishData));
+
+  return Object.keys(ekData).filter((field) => (
+    !canonicalFields.has(field)
+    && Object.hasOwn(rawData, field)
+    && !allowed.has(field)
+  ));
+}
+
 // Fleet-wide graceful-degradation backstop (issue #4786). A non-settling
 // await inside a seeder's fetchFn — e.g. an unguarded R2/S3 body stream whose
 // socket is silently reaped — never rejects, so the Phase-1 try/catch can't
@@ -1696,6 +1760,27 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
           console.warn(`  [extraKey] ${ek.key} declares skipWhenEmpty but ${domain}:${resource} is not in contract mode (no declareRecords) — guard inactive`);
         }
         const ekData = ek.transform ? ek.transform(data) : data;
+
+        // Guard 1 — pre-publish internals escaping through an extra key. `data` here is
+        // the RAW fetcher output, NOT `publishData`: a transform written as `{ ...data }`
+        // re-exports everything publishTransform deliberately stripped from the canonical
+        // key. That shipped an 11.5 MB forecast:predictions-bootstrap:v1 (66x its own
+        // canonical key) and every bootstrap origin miss paid for it. Fail loudly: the
+        // canonical key is already published at this point, so refusing to write the extra
+        // key leaves last-good data in place rather than serving a monstrous payload.
+        const leaked = findLeakedPrePublishFields(data, publishData, ekData, ek);
+        if (leaked.length > 0) {
+          await releaseLock(`${domain}:${resource}`, runId);
+          console.error(
+            `  CONTRACT VIOLATION on extraKey ${ek.key}: re-exports ${leaked.length} pre-publish field(s) `
+            + `that publishTransform strips from the canonical key: ${leaked.join(', ')}. `
+            + `extraKey transforms receive the RAW fetcher output, not the published payload — `
+            + `project it first (e.g. compose with your publishTransform) or list the fields in `
+            + `allowPrePublishFields if they are genuinely intended.`,
+          );
+          await exitAfterTelemetryFlush(1);
+        }
+
         let ekEnvelope = null;
         if (contractMode) {
           const ekDeclare = typeof ek.declareRecords === 'function' ? ek.declareRecords : declareRecords;
@@ -1723,6 +1808,19 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
             schemaVersion: schemaVersion || 1,
             state: ekCount > 0 ? 'OK' : (zeroIsValid ? 'OK_ZERO' : 'OK'),
           };
+        }
+
+        // Guard 2 — blunt backstop. Catches a monstrous payload whatever the cause,
+        // including one this codebase has not seen yet. Measure the serialized UTF-8
+        // value (including a contract envelope), which is what Redis actually stores.
+        const ekBytes = extraKeyPayloadBytes(ek.key, ekData, ekEnvelope);
+        if (ekBytes > MAX_SEEDED_VALUE_BYTES) {
+          await releaseLock(`${domain}:${resource}`, runId);
+          console.error(
+            `  CONTRACT VIOLATION on extraKey ${ek.key}: payload is ${ekBytes} bytes, above the `
+            + `${MAX_SEEDED_VALUE_BYTES}-byte ceiling for a seeded value. Refusing to publish.`,
+          );
+          await exitAfterTelemetryFlush(1);
         }
         await writeExtraKey(ek.key, ekData, ek.ttl || ttlSeconds, ekEnvelope);
         if (contractMode && ek.metaKey) {
